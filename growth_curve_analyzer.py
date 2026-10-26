@@ -325,6 +325,15 @@ class GrowthCurveApp(tk.Tk):
         self.gt_ax = None
         self.gt_axes: list = []               # for config popup
 
+        # Plate drag-paint state for fast multi-well labeling
+        self._painting = False
+        self._paint_assign = True
+        self._paint_visited = set()
+        self._plate_item_to_well = {}
+        self._paint_dragged = False
+        self._paint_start_well = None
+        self._paint_start_assigned = False
+
         self._new_group('BLANK', 'BLANK', BLANK_COLOR)
         self._build_ui()
         self._refresh_groups_panel()
@@ -350,6 +359,21 @@ class GrowthCurveApp(tk.Tk):
     def set_active(self, key):
         self.active_key = key
         self._refresh_groups_panel()
+        self._update_group_action_buttons()
+
+    def _update_group_action_buttons(self):
+        if not hasattr(self, 'delete_group_btn'):
+            return
+        if self.active_key and self.active_key != 'BLANK':
+            self.delete_group_btn.configure(state='normal')
+        else:
+            self.delete_group_btn.configure(state='disabled')
+
+    def delete_active_group(self):
+        if not self.active_key:
+            messagebox.showinfo('No Group Selected', 'Select a group first.')
+            return
+        self.delete_group(self.active_key)
 
     def delete_group(self, key):
         if key == 'BLANK':
@@ -360,11 +384,13 @@ class GrowthCurveApp(tk.Tk):
         if self.active_key == key:
             self.active_key = None
         self._refresh_groups_panel()
+        self._update_group_action_buttons()
         self._refresh_well_colors()
 
     def clear_group_wells(self, key):
         self.groups[key]['wells'].clear()
         self._refresh_groups_panel()
+        self._update_group_action_buttons()
         self._refresh_well_colors()
 
     # ── Template save / load ──────────────────────────────────────────────────
@@ -464,6 +490,11 @@ class GrowthCurveApp(tk.Tk):
         ttk.Button(left, text='＋  New Group', command=self.add_group).pack(
             fill='x', ipady=5, pady=(0, 4))
 
+        self.delete_group_btn = ttk.Button(
+            left, text='Delete Selected Group', command=self.delete_active_group)
+        self.delete_group_btn.pack(fill='x', ipady=3, pady=(0, 8))
+        self.delete_group_btn.configure(state='disabled')
+
         # Template buttons
         tmpl_row = ttk.Frame(left)
         tmpl_row.pack(fill='x', pady=(0, 8))
@@ -486,7 +517,7 @@ class GrowthCurveApp(tk.Tk):
         self.grp_canvas.bind('<Configure>', self._on_grp_canvas_resize)
 
         ttk.Label(left,
-                  text='① Add groups  ② Click to select\n③ Click wells to assign  ④ Load & Process',
+                  text='① Add groups  ② Click to select\n③ Click to toggle, drag to assign  ④ Load & Process',
                   font=('Helvetica', 9), foreground='#777777', justify='left'
                   ).pack(anchor='w', pady=(10, 0))
 
@@ -546,6 +577,7 @@ class GrowthCurveApp(tk.Tk):
 
         self.ovals = {}
         self.oval_texts = {}
+        self._plate_item_to_well = {}
 
         for ri, row in enumerate(ROWS):
             c.create_text(ML - R - 20, MT + ri * S, text=row,
@@ -558,10 +590,15 @@ class GrowthCurveApp(tk.Tk):
                 txt = c.create_text(x, y, text='', font=('Helvetica', 7, 'bold'), fill='white')
                 self.ovals[wn] = oval
                 self.oval_texts[wn] = txt
+                self._plate_item_to_well[oval] = wn
+                self._plate_item_to_well[txt] = wn
                 for item in [oval, txt]:
-                    c.tag_bind(item, '<Button-1>', lambda e, w=wn: self.click_well(w))
                     c.tag_bind(item, '<Enter>', lambda e: c.config(cursor='hand2'))
                     c.tag_bind(item, '<Leave>', lambda e: c.config(cursor=''))
+
+        c.bind('<Button-1>', self._on_plate_press)
+        c.bind('<B1-Motion>', self._on_plate_drag)
+        c.bind('<ButtonRelease-1>', self._end_paint)
 
     # ── Growth Curves tab ─────────────────────────────────────────────────────
     def _build_results_tab(self):
@@ -871,15 +908,83 @@ class GrowthCurveApp(tk.Tk):
             messagebox.showinfo('Select a Group',
                                 'Create and select a group first, then click wells to assign.')
             return
+
         g = self.groups[self.active_key]
-        if well in g['wells']:
-            g['wells'].discard(well)
-        else:
+        assign = (well not in g['wells'])
+        self._apply_well_assignment(well, assign)
+        self._refresh_well_colors()
+        self._refresh_groups_panel()
+
+    def _apply_well_assignment(self, well, assign: bool):
+        g = self.groups[self.active_key]
+        if assign:
             for grp in self.groups.values():
                 grp['wells'].discard(well)
             g['wells'].add(well)
+        else:
+            g['wells'].discard(well)
+
+    def _start_paint(self, well):
+        if not self.active_key:
+            messagebox.showinfo('Select a Group',
+                                'Create and select a group first, then click wells to assign.')
+            return
+
+        self._painting = True
+        self._paint_dragged = False
+        self._paint_start_well = well
+        self._paint_start_assigned = (well in self.groups[self.active_key]['wells'])
+        self._paint_assign = True
+        self._paint_visited = set()
+
+    def _paint_over(self, well):
+        if not self._painting or not self.active_key:
+            return
+        if well in self._paint_visited:
+            return
+
+        self._apply_well_assignment(well, self._paint_assign)
+        self._paint_visited.add(well)
         self._refresh_well_colors()
         self._refresh_groups_panel()
+
+    def _well_from_event(self, event):
+        ids = self.plate.find_overlapping(event.x, event.y, event.x, event.y)
+        for item_id in reversed(ids):
+            well = self._plate_item_to_well.get(item_id)
+            if well is not None:
+                return well
+        return None
+
+    def _on_plate_press(self, event):
+        well = self._well_from_event(event)
+        if well is None:
+            return
+        self._start_paint(well)
+
+    def _on_plate_drag(self, event):
+        if not self._painting:
+            return
+        self._paint_dragged = True
+        if self._paint_start_well is not None and self._paint_start_well not in self._paint_visited:
+            self._paint_over(self._paint_start_well)
+        well = self._well_from_event(event)
+        if well is None:
+            return
+        self._paint_over(well)
+
+    def _end_paint(self, _event=None):
+        if self._painting and self._paint_start_well is not None and not self._paint_dragged:
+            # Single click toggles membership for that one well.
+            self._apply_well_assignment(self._paint_start_well, not self._paint_start_assigned)
+            self._refresh_well_colors()
+            self._refresh_groups_panel()
+
+        self._painting = False
+        self._paint_visited = set()
+        self._paint_dragged = False
+        self._paint_start_well = None
+        self._paint_start_assigned = False
 
     def _refresh_well_colors(self):
         well_map = {}
